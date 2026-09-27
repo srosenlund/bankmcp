@@ -15,6 +15,8 @@ export interface SetupInput {
 }
 
 export function setupAvailable(): boolean {
+  // Without a disk the page has nowhere to keep what it collects: configure through the environment.
+  if (config.storeBackend !== "file") return false;
   const hasPassword = config.localMode || Boolean(config.adminPasswordHash || config.adminPassword);
   return !config.lockedByEnv && !(config.appId && (config.privateKey || config.privateKeyPath) && hasPassword);
 }
