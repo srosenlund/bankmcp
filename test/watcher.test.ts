@@ -46,3 +46,16 @@ test("credit_matching matches description too and respects min_amount", () => {
   const txs = [{ ...tx("a", 2500, "STRIPE PAYMENTS"), description: "Stripe payout" }, { ...tx("b", 50, "STRIPE PAYMENTS"), description: "Stripe refund" }];
   assert.equal(evaluate(account, [w], undefined, txs).length, 1);
 });
+
+test("create_watch cannot choose a webhook destination; only the operator's NOTIFY_WEBHOOK_URL is used", async () => {
+  const { createServer } = await import("../src/mcp.ts");
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+  const [serverSide, clientSide] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test", version: "0" });
+  await Promise.all([createServer().connect(serverSide), client.connect(clientSide)]);
+  const tool = (await client.listTools()).tools.find((t) => t.name === "create_watch");
+  assert.ok(tool, "create_watch is registered");
+  assert.equal("webhook_url" in (tool.inputSchema.properties ?? {}), false);
+  await client.close();
+});
