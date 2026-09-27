@@ -116,8 +116,12 @@ export class SingleUserProvider implements OAuthServerProvider {
         };
         store.update((d) => {
           // Keep the store small: a connector re-registers when it is re-added.
-          const ids = Object.keys(d.oauth.clients);
-          if (ids.length > 20) for (const id of ids.slice(0, ids.length - 20)) delete d.oauth.clients[id];
+          // Only clients without a live token are dropped, so a re-registering
+          // connector cannot evict a client that still refreshes (the Finance job).
+          const live = new Set(Object.values(d.oauth.tokens).filter((t) => t.expires > now()).map((t) => t.client_id));
+          const idle = Object.keys(d.oauth.clients).filter((id) => !live.has(id));
+          // At most 20 idle clients remain, counting the one being added.
+          if (idle.length >= 20) for (const id of idle.slice(0, idle.length - 19)) delete d.oauth.clients[id];
           d.oauth.clients[full.client_id] = full;
         });
         await store.flush();

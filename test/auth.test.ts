@@ -117,3 +117,18 @@ test("well-known MCP client domains are allowed by default", async () => {
   for (const u of ["https://claude.ai/api/mcp/auth_callback", "https://chatgpt.com/connector_platform_oauth_redirect", "https://chat.mistral.ai/oauth/callback", "https://cursor.com/oauth/callback", "http://localhost:3456/cb"]) assert.equal(redirectAllowed(u), true, u);
   for (const u of ["https://evil.example/cb", "https://chatgpt.com.evil.example/cb", "https://notclaude.ai/cb"]) assert.equal(redirectAllowed(u), false, u);
 });
+
+test("re-registering connectors never evict a client that still holds a live token", async () => {
+  const store = new Store(join(mkdtempSync(join(tmpdir(), "bank-")), "store.json"));
+  const provider = new SingleUserProvider(store);
+  const keeper = await provider.clientsStore.registerClient!({ redirect_uris: ["http://localhost:8765/callback"], client_name: "Finance" });
+  const { out, res } = fakeRes();
+  await provider.authorize(keeper, { codeChallenge: "c", redirectUri: "http://localhost:8765/callback" }, res);
+  const id = /name="request" value="([^"]+)"/.exec(out.body)![1]!;
+  const ok = await provider.completeLogin(id, "correct horse", "7.7.7.7");
+  assert.ok("redirect" in ok);
+  await provider.exchangeAuthorizationCode(keeper, new URL(ok.redirect).searchParams.get("code")!, undefined, "http://localhost:8765/callback");
+  for (let i = 0; i < 30; i++) await provider.clientsStore.registerClient!({ redirect_uris: ["https://grok.com/cb"], client_name: `Grok ${i}` });
+  assert.ok(store.data.oauth.clients[keeper.client_id], "client with a live refresh token survives");
+  assert.ok(Object.keys(store.data.oauth.clients).length <= 21, "idle clients are still trimmed");
+});
