@@ -10,7 +10,7 @@ import type { OAuthServerProvider, AuthorizationParams } from "@modelcontextprot
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { OAuthClientInformationFull, OAuthTokenRevocationRequest, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { InvalidGrantError, InvalidClientError, InvalidClientMetadataError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import { InvalidGrantError, InvalidTokenError, InvalidClientMetadataError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { config } from "./config.ts";
 import { loginPage } from "./pages.ts";
 export { loginPage, shell as page } from "./pages.ts";
@@ -235,8 +235,8 @@ export class SingleUserProvider implements OAuthServerProvider {
 
   async verifyAccessToken(tokenValue: string): Promise<AuthInfo> {
     const t = this.store.data.oauth.tokens[sha256(tokenValue)];
-    if (!t || t.kind !== "access") throw new InvalidClientError("Invalid access token");
-    if (t.expires < now()) throw new InvalidClientError("Access token expired");
+    if (!t || t.kind !== "access") throw new InvalidTokenError("Invalid access token");
+    if (t.expires < now()) throw new InvalidTokenError("Access token expired");
     return { token: tokenValue, clientId: t.client_id, scopes: t.scopes, expiresAt: t.expires, resource: t.resource ? new URL(t.resource) : undefined };
   }
 

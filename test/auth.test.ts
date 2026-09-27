@@ -132,3 +132,13 @@ test("re-registering connectors never evict a client that still holds a live tok
   assert.ok(store.data.oauth.clients[keeper.client_id], "client with a live refresh token survives");
   assert.ok(Object.keys(store.data.oauth.clients).length <= 21, "idle clients are still trimmed");
 });
+
+test("expired or unknown access tokens are invalid_token (HTTP 401), so MCP clients refresh instead of failing", async () => {
+  const { InvalidTokenError } = await import("@modelcontextprotocol/sdk/server/auth/errors.js");
+  const { createHash } = await import("node:crypto");
+  const store = new Store(join(mkdtempSync(join(tmpdir(), "bank-")), "store.json"));
+  const provider = new SingleUserProvider(store);
+  store.update((d) => void (d.oauth.tokens[createHash("sha256").update("old").digest("hex")] = { kind: "access", client_id: "c", scopes: [], expires: 1 }));
+  await assert.rejects(provider.verifyAccessToken("old"), InvalidTokenError);
+  await assert.rejects(provider.verifyAccessToken("unknown"), InvalidTokenError);
+});
