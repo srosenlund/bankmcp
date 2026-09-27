@@ -76,7 +76,7 @@ switch (command) {
       process.exit(1);
     }
     const s = store();
-    console.log(`Store: ${s.path}`);
+    console.log(`Store: ${s.location}`);
     for (const x of s.sessions()) console.log(`  ${x.bank.name}: ${s.accounts().filter((a) => a.session_id === x.id).length} account(s), consent ${daysLeft(x.valid_until)} days left`);
     if (!s.sessions().length) console.log("  no banks connected yet");
     console.log(`Watches: ${s.watches().length}, webhook ${config.notifyWebhookUrl ? "configured" : "not set"}`);

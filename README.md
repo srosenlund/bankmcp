@@ -91,6 +91,24 @@ terminator in front (Caddy needs two lines:
 public address. Fly.io works like Railway: volume at `/data`, the app name
 gives the address.
 
+**Vercel (no disk):** keep the state in a Supabase table instead of a volume.
+Create the table once in the SQL editor:
+
+```sql
+create table public.bankmcp_state (
+  id text primary key, version bigint not null default 1,
+  data jsonb not null, updated_at timestamptz not null default now());
+alter table public.bankmcp_state enable row level security;
+```
+
+No policies are needed: only the service role reaches the row. Then
+`vercel deploy` from the repo (the included [vercel.json](vercel.json) runs
+`src/server.ts` as an Express service and schedules the watch check once a
+day) and set `STORE_BACKEND=supabase`, `SUPABASE_URL`,
+`SUPABASE_SERVICE_ROLE_KEY` and `CRON_SECRET` next to the variables below.
+Every request reads the document first and writes it back before answering,
+so it does not matter which instance serves a request.
+
 Open the address. A fresh server shows a setup page.
 
 #### 2. Register an Enable Banking application
@@ -123,6 +141,9 @@ appears:
 | `BASE_URL` | `https://YOUR-HOST` (Railway and Fly set this for you) |
 | `DEFAULT_COUNTRY` | your country code, e.g. `DK` |
 | `APP_NAME` | optional, the name shown on the sign-in and status pages (default `BankMCP™`) |
+| `STORE_BACKEND` | `supabase` to keep the state in a Supabase table (hosts without a disk); default `file` |
+| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | the project URL and service role key when `STORE_BACKEND=supabase` (`SUPABASE_SCHEMA` defaults to `public`) |
+| `CRON_SECRET` | bearer secret for `GET /internal/run-watches`, the scheduled watch check on hosts without a long-lived process |
 
 Optional: `NOTIFY_WEBHOOK_URL` for watch notifications and sign-in alerts (a
 Slack incoming webhook works). Full list in [.env.example](.env.example).

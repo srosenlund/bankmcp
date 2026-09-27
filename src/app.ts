@@ -1,5 +1,7 @@
 // HTTP entry point: the MCP endpoint behind OAuth, the OAuth server itself,
-// the Enable Banking redirect target, and a status page.
+// the Enable Banking redirect target, and a status page. Every request loads
+// the state document first and writes it back before answering, so the app
+// also runs where each request may land on a fresh process.
 import { createHash } from "node:crypto";
 import express from "express";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
@@ -12,7 +14,7 @@ import { SingleUserProvider } from "./auth.ts";
 import { connectedPage, failedPage, loginPage, privacyPage, setupPage, signInFailedPage, statusPage, termsPage } from "./pages.ts";
 import { applySetup, setupAvailable } from "./setup.ts";
 import { createServer, VERSION } from "./mcp.ts";
-import { startWatcher } from "./watcher.ts";
+import { runWatches, startWatcher } from "./watcher.ts";
 
 export interface AppOptions {
   /** Mount the OAuth server and the /mcp endpoint. Off in local (stdio) mode. */
@@ -50,17 +52,30 @@ export function createApp(opts: AppOptions) {
   });
 
   // Changing the admin password logs every client out.
-  function rememberPasswordFingerprint(): void {
+  async function rememberPasswordFingerprint(): Promise<void> {
     const secret = config.adminPasswordHash || config.adminPassword;
     if (!secret) return;
     const fingerprint = createHash("sha256").update(secret).digest("hex");
     if (store().data.oauth.password_fingerprint && store().data.oauth.password_fingerprint !== fingerprint) {
-      provider.revokeAll();
+      await provider.revokeAll();
       log("admin password changed: all tokens revoked");
     }
-    if (store().data.oauth.password_fingerprint !== fingerprint) store().update((d) => void (d.oauth.password_fingerprint = fingerprint));
+    if (store().data.oauth.password_fingerprint !== fingerprint) {
+      store().update((d) => void (d.oauth.password_fingerprint = fingerprint));
+      await store().flush();
+    }
   }
-  if (opts.remote) rememberPasswordFingerprint();
+
+  // The state document is read before every request; routes that change it call flush().
+  app.use(async (_req, _res, next) => {
+    try {
+      await store().load();
+      if (opts.remote) await rememberPasswordFingerprint();
+      next();
+    } catch (err) {
+      next(err);
+    }
+  });
 
   let watcherStarted = false;
   function startWatcherOnce(): void {
@@ -90,13 +105,13 @@ export function createApp(opts: AppOptions) {
     res.type("html").send(statusPage({ problems: setupProblems(), mcpUrl: mcpUrl.href, callbackUrl }));
   });
 
-  app.post("/setup", express.urlencoded({ extended: false, limit: "64kb" }), (req, res) => {
+  app.post("/setup", express.urlencoded({ extended: false, limit: "64kb" }), async (req, res) => {
     if (!setupAvailable()) return void res.status(404).type("html").send(failedPage("Setup is already complete."));
     const body = req.body as Record<string, string | undefined>;
     const error = applySetup(body);
     if (error) return void res.status(400).set("Content-Security-Policy", setupCsp).type("html").send(setupPage({ error, values: { app_id: body.app_id, country: body.country }, baseUrl: config.baseUrl }));
     log("setup completed via the setup page");
-    if (opts.remote) rememberPasswordFingerprint();
+    if (opts.remote) await rememberPasswordFingerprint();
     startWatcherOnce();
     res.redirect(303, "/");
   });
@@ -119,9 +134,9 @@ export function createApp(opts: AppOptions) {
     }),
   );
 
-  if (opts.remote) app.post("/login", express.urlencoded({ extended: false }), (req, res) => {
+  if (opts.remote) app.post("/login", express.urlencoded({ extended: false }), async (req, res) => {
     const { request, password } = req.body as Record<string, string | undefined>;
-    const result = provider.completeLogin(String(request ?? ""), String(password ?? ""), req.ip ?? "unknown");
+    const result = await provider.completeLogin(String(request ?? ""), String(password ?? ""), req.ip ?? "unknown");
     if ("redirect" in result) return void res.redirect(302, result.redirect);
     if (result.requestId) return void res.status(401).type("html").send(loginPage({ requestId: result.requestId, error: result.error }));
     res.status(400).type("html").send(signInFailedPage(result.error));
@@ -150,11 +165,21 @@ export function createApp(opts: AppOptions) {
   if (opts.remote) app.get("/mcp", bearer, (_req, res) => void res.status(405).set("Allow", "POST").json({ error: "This server is stateless; use POST." }));
   if (opts.remote) app.delete("/mcp", bearer, (_req, res) => void res.status(405).set("Allow", "POST").json({ error: "This server is stateless; use POST." }));
 
+  // --- Scheduled watch run for hosts without a long-lived process (Vercel cron) ---
+
+  if (opts.remote) app.get("/internal/run-watches", async (req, res) => {
+    if (!config.cronSecret || req.get("authorization") !== `Bearer ${config.cronSecret}`) return void res.status(401).json({ error: "unauthorized" });
+    if (!isConfigured()) return void res.status(503).json({ error: "not configured" });
+    res.json(await runWatches());
+  });
+
   // --- Enable Banking redirect target ---
 
   app.get("/callback", async (req, res) => {
     const { code, state, error, error_description } = req.query as Record<string, string | undefined>;
     const pending = state ? store().takePendingAuth(state) : undefined;
+    // The state is single use even when the bank call below fails.
+    await store().flush();
     const failed = (msg: string) => res.status(400).type("html").send(failedPage(msg));
 
     if (error || !code) return void failed(error_description || error || "The bank did not return an authorization code.");
@@ -163,6 +188,7 @@ export function createApp(opts: AppOptions) {
     try {
       const session = await eb.createSession(code);
       store().addSession(session);
+      await store().flush();
       log(`bank connected: ${session.aspsp.name}, ${session.accounts.length} account(s)`);
       res.type("html").send(connectedPage(session));
     } catch (err) {

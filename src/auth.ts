@@ -1,7 +1,9 @@
 // A complete OAuth 2.1 authorization server with exactly one user: you.
 // The MCP SDK provides discovery, dynamic client registration, PKCE checks
 // and the token endpoint; this file supplies the storage behind them and a
-// password login page. Tokens are stored hashed.
+// password login page. Tokens are stored hashed. Everything, including the
+// sign-ins waiting for a password, lives in the store, so any instance of the
+// server can finish a flow another instance started.
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type { Response } from "express";
 import type { OAuthServerProvider, AuthorizationParams } from "@modelcontextprotocol/sdk/server/auth/provider.js";
@@ -12,7 +14,7 @@ import { InvalidGrantError, InvalidClientError, InvalidClientMetadataError } fro
 import { config } from "./config.ts";
 import { loginPage } from "./pages.ts";
 export { loginPage, shell as page } from "./pages.ts";
-import type { Store, OAuthClient } from "./store.ts";
+import type { Store, StoreData, OAuthClient, Token } from "./store.ts";
 
 const ACCESS_TTL = 60 * 60; // 1 hour
 const REFRESH_TTL = 90 * 24 * 60 * 60; // 90 days
@@ -56,13 +58,11 @@ const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 const token = () => randomBytes(32).toString("base64url");
 const now = () => Math.floor(Date.now() / 1000);
 
-// Authorization requests waiting for the password, keyed by a one-time id
-// embedded in the login form. Memory only: they live ten minutes.
-interface PendingLogin {
-  client: OAuthClientInformationFull;
-  params: AuthorizationParams;
-  expires: number;
-  attempts: number;
+/** Drop expired sign-ins and lockouts. Called inside a store update. */
+function sweep(d: StoreData): void {
+  const t = now();
+  for (const [k, v] of Object.entries(d.oauth.pending_logins)) if (v.expires < t) delete d.oauth.pending_logins[k];
+  for (const [k, v] of Object.entries(d.oauth.login_failures)) if (v.until && v.until < t) delete d.oauth.login_failures[k];
 }
 
 export interface LoginEvent {
@@ -72,9 +72,13 @@ export interface LoginEvent {
   reason?: string;
 }
 
+type LoginOutcome =
+  | { kind: "locked" }
+  | { kind: "expired" }
+  | { kind: "wrong"; clientName?: string; requestId?: string }
+  | { kind: "ok"; clientName?: string; redirect: string };
+
 export class SingleUserProvider implements OAuthServerProvider {
-  private pendingLogins = new Map<string, PendingLogin>();
-  private failures = new Map<string, { count: number; until: number }>();
   private store: Store;
   private onLogin?: (e: LoginEvent) => void;
 
@@ -83,13 +87,14 @@ export class SingleUserProvider implements OAuthServerProvider {
     this.onLogin = opts.onLogin;
   }
 
-  /** Every token and pending code is dropped. Used when the admin password changes. */
-  revokeAll(): void {
-    this.pendingLogins.clear();
+  /** Every token, pending code and pending sign-in is dropped. Used when the admin password changes. */
+  async revokeAll(): Promise<void> {
     this.store.update((d) => {
       d.oauth.tokens = {};
       d.oauth.codes = {};
+      d.oauth.pending_logins = {};
     });
+    await this.store.flush();
   }
 
   get clientsStore(): OAuthRegisteredClientsStore {
@@ -98,7 +103,7 @@ export class SingleUserProvider implements OAuthServerProvider {
       getClient(clientId) {
         return store.data.oauth.clients[clientId] as OAuthClientInformationFull | undefined;
       },
-      registerClient(client) {
+      async registerClient(client) {
         for (const uri of client.redirect_uris) {
           if (!redirectAllowed(uri)) throw new InvalidClientMetadataError(`redirect_uri host not allowed: ${new URL(uri).hostname}. Set ALLOWED_REDIRECT_HOSTS on the server to permit it.`);
         }
@@ -115,60 +120,77 @@ export class SingleUserProvider implements OAuthServerProvider {
           if (ids.length > 20) for (const id of ids.slice(0, ids.length - 20)) delete d.oauth.clients[id];
           d.oauth.clients[full.client_id] = full;
         });
+        await store.flush();
         return full as OAuthClientInformationFull;
       },
     };
   }
 
   async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void> {
-    this.sweep();
     const id = token();
-    this.pendingLogins.set(id, { client, params, expires: now() + LOGIN_TTL, attempts: 0 });
+    this.store.update((d) => {
+      sweep(d);
+      d.oauth.pending_logins[id] = {
+        client: client as OAuthClient,
+        params: { redirectUri: params.redirectUri, codeChallenge: params.codeChallenge, state: params.state, scopes: params.scopes, resource: params.resource?.href },
+        expires: now() + LOGIN_TTL,
+        attempts: 0,
+      };
+    });
+    await this.store.flush();
     res.status(200).type("html").send(loginPage({ requestId: id, clientName: client.client_name, returnTo: new URL(params.redirectUri).hostname }));
   }
 
   /** Called by POST /login. Returns the redirect URL on success, or an error message. */
-  completeLogin(requestId: string, password: string, ip: string): { redirect: string } | { error: string; requestId?: string } {
-    this.sweep();
-    const lock = this.failures.get(ip);
-    if (lock && lock.until > now()) {
-      this.onLogin?.({ ok: false, ip, reason: "locked out" });
-      return { error: "Too many attempts. Try again in a few minutes." };
-    }
-
-    const pending = this.pendingLogins.get(requestId);
-    if (!pending) return { error: "This sign-in page has expired or the server restarted. Go back to your assistant, click Connect again, and enter the password within 30 minutes." };
-
-    if (!verifyPassword(password)) {
-      pending.attempts += 1;
-      const f = this.failures.get(ip) ?? { count: 0, until: 0 };
-      f.count += 1;
-      if (f.count >= 5) f.until = now() + 15 * 60;
-      this.failures.set(ip, f);
-      if (pending.attempts >= 5) this.pendingLogins.delete(requestId);
-      this.onLogin?.({ ok: false, ip, clientName: pending.client.client_name, reason: "wrong password" });
-      return { error: "Wrong password.", requestId: pending.attempts < 5 ? requestId : undefined };
-    }
-
-    this.pendingLogins.delete(requestId);
-    this.failures.delete(ip);
-    this.onLogin?.({ ok: true, ip, clientName: pending.client.client_name });
+  async completeLogin(requestId: string, password: string, ip: string): Promise<{ redirect: string } | { error: string; requestId?: string }> {
+    // The code is minted outside the update so a replayed update stores the same one.
     const code = token();
-    this.store.update((d) => {
+    const outcome = this.store.update((d): LoginOutcome => {
+      sweep(d);
+      const lock = d.oauth.login_failures[ip];
+      if (lock && lock.until > now()) return { kind: "locked" };
+      const pending = d.oauth.pending_logins[requestId];
+      if (!pending) return { kind: "expired" };
+      if (!verifyPassword(password)) {
+        pending.attempts += 1;
+        const f = d.oauth.login_failures[ip] ?? { count: 0, until: 0 };
+        f.count += 1;
+        if (f.count >= 5) f.until = now() + 15 * 60;
+        d.oauth.login_failures[ip] = f;
+        if (pending.attempts >= 5) delete d.oauth.pending_logins[requestId];
+        return { kind: "wrong", clientName: pending.client.client_name, requestId: pending.attempts < 5 ? requestId : undefined };
+      }
+      delete d.oauth.pending_logins[requestId];
+      delete d.oauth.login_failures[ip];
       for (const [c, v] of Object.entries(d.oauth.codes)) if (v.expires < now()) delete d.oauth.codes[c];
       d.oauth.codes[sha256(code)] = {
         client_id: pending.client.client_id,
         code_challenge: pending.params.codeChallenge,
         redirect_uri: pending.params.redirectUri,
-        resource: pending.params.resource?.href,
+        resource: pending.params.resource,
         scopes: pending.params.scopes ?? [],
         expires: now() + CODE_TTL,
       };
+      const url = new URL(pending.params.redirectUri);
+      url.searchParams.set("code", code);
+      if (pending.params.state) url.searchParams.set("state", pending.params.state);
+      return { kind: "ok", clientName: pending.client.client_name, redirect: url.href };
     });
-    const url = new URL(pending.params.redirectUri);
-    url.searchParams.set("code", code);
-    if (pending.params.state) url.searchParams.set("state", pending.params.state);
-    return { redirect: url.href };
+    await this.store.flush();
+
+    switch (outcome.kind) {
+      case "locked":
+        this.onLogin?.({ ok: false, ip, reason: "locked out" });
+        return { error: "Too many attempts. Try again in a few minutes." };
+      case "expired":
+        return { error: "This sign-in page has expired or the server restarted. Go back to your assistant, click Connect again, and enter the password within 30 minutes." };
+      case "wrong":
+        this.onLogin?.({ ok: false, ip, clientName: outcome.clientName, reason: "wrong password" });
+        return { error: "Wrong password.", requestId: outcome.requestId };
+      case "ok":
+        this.onLogin?.({ ok: true, ip, clientName: outcome.clientName });
+        return { redirect: outcome.redirect };
+    }
   }
 
   async challengeForAuthorizationCode(client: OAuthClientInformationFull, authorizationCode: string): Promise<string> {
@@ -183,10 +205,13 @@ export class SingleUserProvider implements OAuthServerProvider {
     if (!c || c.client_id !== client.client_id || c.expires < now()) throw new InvalidGrantError("Invalid or expired authorization code");
     if (redirectUri && redirectUri !== c.redirect_uri) throw new InvalidGrantError("redirect_uri does not match");
     if (resource && c.resource && resource.href !== c.resource) throw new InvalidGrantError("resource does not match");
-    return this.store.update((d) => {
+    const minted = { access: token(), refresh: token() };
+    const out = this.store.update((d) => {
       delete d.oauth.codes[key];
-      return this.issue(d.oauth.tokens, client.client_id, c.scopes, c.resource);
+      return this.issue(d.oauth.tokens, client.client_id, c.scopes, c.resource, minted);
     });
+    await this.store.flush();
+    return out;
   }
 
   async exchangeRefreshToken(client: OAuthClientInformationFull, refreshToken: string, scopes?: string[], resource?: URL): Promise<OAuthTokens> {
@@ -195,10 +220,13 @@ export class SingleUserProvider implements OAuthServerProvider {
     if (!t || t.kind !== "refresh" || t.client_id !== client.client_id) throw new InvalidGrantError("Invalid refresh token");
     if (t.expires < now()) throw new InvalidGrantError("Refresh token expired");
     if (resource && t.resource && resource.href !== t.resource) throw new InvalidGrantError("resource does not match");
-    return this.store.update((d) => {
+    const minted = { access: token(), refresh: token() };
+    const out = this.store.update((d) => {
       delete d.oauth.tokens[key];
-      return this.issue(d.oauth.tokens, client.client_id, scopes?.length ? scopes : t.scopes, t.resource);
+      return this.issue(d.oauth.tokens, client.client_id, scopes?.length ? scopes : t.scopes, t.resource, minted);
     });
+    await this.store.flush();
+    return out;
   }
 
   async verifyAccessToken(tokenValue: string): Promise<AuthInfo> {
@@ -211,21 +239,16 @@ export class SingleUserProvider implements OAuthServerProvider {
   async revokeToken(client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest): Promise<void> {
     const key = sha256(request.token);
     const t = this.store.data.oauth.tokens[key];
-    if (t && t.client_id === client.client_id) this.store.update((d) => void delete d.oauth.tokens[key]);
+    if (t && t.client_id === client.client_id) {
+      this.store.update((d) => void delete d.oauth.tokens[key]);
+      await this.store.flush();
+    }
   }
 
-  private issue(tokens: Record<string, import("./store.ts").Token>, clientId: string, scopes: string[], resource?: string): OAuthTokens {
+  private issue(tokens: Record<string, Token>, clientId: string, scopes: string[], resource: string | undefined, minted: { access: string; refresh: string }): OAuthTokens {
     for (const [k, v] of Object.entries(tokens)) if (v.expires < now()) delete tokens[k];
-    const access = token();
-    const refresh = token();
-    tokens[sha256(access)] = { kind: "access", client_id: clientId, scopes, resource, expires: now() + ACCESS_TTL };
-    tokens[sha256(refresh)] = { kind: "refresh", client_id: clientId, scopes, resource, expires: now() + REFRESH_TTL };
-    return { access_token: access, token_type: "bearer", expires_in: ACCESS_TTL, refresh_token: refresh, scope: scopes.join(" ") || undefined };
-  }
-
-  private sweep() {
-    const t = now();
-    for (const [k, v] of this.pendingLogins) if (v.expires < t) this.pendingLogins.delete(k);
-    for (const [k, v] of this.failures) if (v.until && v.until < t) this.failures.delete(k);
+    tokens[sha256(minted.access)] = { kind: "access", client_id: clientId, scopes, resource, expires: now() + ACCESS_TTL };
+    tokens[sha256(minted.refresh)] = { kind: "refresh", client_id: clientId, scopes, resource, expires: now() + REFRESH_TTL };
+    return { access_token: minted.access, token_type: "bearer", expires_in: ACCESS_TTL, refresh_token: minted.refresh, scope: scopes.join(" ") || undefined };
   }
 }

@@ -11,6 +11,9 @@ const env = process.env;
 const localMode = env.BANKMCP_LOCAL === "1";
 const port = Number(env.PORT ?? 8080);
 const dataDir = env.DATA_DIR ?? (localMode ? join(homedir(), ".bankmcp") : "./data");
+// Where the state document lives: a file in DATA_DIR, or a Supabase table for
+// hosts without a persistent disk (Vercel and similar). Secrets never go there.
+const storeBackend = env.STORE_BACKEND === "supabase" ? "supabase" : "file";
 
 export interface Settings {
   app_id?: string;
@@ -47,6 +50,7 @@ function detectBaseUrl(): string {
   if (env.BASE_URL) return env.BASE_URL.replace(/\/+$/, "");
   if (env.RAILWAY_PUBLIC_DOMAIN) return `https://${env.RAILWAY_PUBLIC_DOMAIN}`;
   if (env.FLY_APP_NAME) return `https://${env.FLY_APP_NAME}.fly.dev`;
+  if (env.VERCEL_PROJECT_PRODUCTION_URL) return `https://${env.VERCEL_PROJECT_PRODUCTION_URL}`;
   if (localMode) return `https://localhost:${port}`;
   return `http://localhost:${port}`;
 }
@@ -70,6 +74,12 @@ export const config = {
   port,
   baseUrl: detectBaseUrl(),
   dataDir,
+  storeBackend,
+  supabaseUrl: (env.SUPABASE_URL ?? "").replace(/\/+$/, ""),
+  supabaseKey: env.SUPABASE_SERVICE_ROLE_KEY ?? "",
+  supabaseSchema: env.SUPABASE_SCHEMA ?? "public",
+  /** Bearer secret for the scheduled watch run on hosts without a long-lived process. */
+  cronSecret: env.CRON_SECRET ?? "",
   appName: env.APP_NAME ?? "BankMCP™",
   get adminPasswordHash(): string {
     return env.ADMIN_PASSWORD_HASH ?? settings.admin_password_hash ?? "";
@@ -119,11 +129,15 @@ export function setupProblems(): string[] {
   }
   if (!localMode && !config.adminPasswordHash && !config.adminPassword) problems.push("Admin password is not set");
   if (!/^https?:\/\//.test(config.baseUrl)) problems.push("BASE_URL must start with http:// or https://");
-  try {
-    mkdirSync(config.dataDir, { recursive: true });
-    accessSync(config.dataDir, constants.W_OK);
-  } catch {
-    problems.push(`DATA_DIR ${config.dataDir} is not writable by this process (check volume permissions)`);
+  if (config.storeBackend === "supabase") {
+    if (!config.supabaseUrl || !config.supabaseKey) problems.push("STORE_BACKEND=supabase needs SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY");
+  } else {
+    try {
+      mkdirSync(config.dataDir, { recursive: true });
+      accessSync(config.dataDir, constants.W_OK);
+    } catch {
+      problems.push(`DATA_DIR ${config.dataDir} is not writable by this process (check volume permissions)`);
+    }
   }
   return problems;
 }

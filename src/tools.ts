@@ -47,6 +47,7 @@ async function withAccount<T>(ref: string, fn: (a: StoredAccount) => Promise<T>)
 
 function guard<A extends unknown[]>(fn: (...args: A) => Promise<ReturnType<typeof json> | ReturnType<typeof fail>>) {
   return async (...args: A) => {
+    let out: ReturnType<typeof json> | ReturnType<typeof fail>;
     try {
       if (!isConfigured()) {
         return fail(
@@ -54,12 +55,19 @@ function guard<A extends unknown[]>(fn: (...args: A) => Promise<ReturnType<typeo
             (config.localMode ? " The browser will warn about a self-signed certificate on localhost; continue past it." : ""),
         );
       }
-      return await fn(...args);
+      out = await fn(...args);
     } catch (err) {
-      if (err instanceof ToolError) return fail(err.message);
-      if (err instanceof EnableBankingError) return fail(`Enable Banking returned ${err.status}: ${err.body.slice(0, 500)}`);
-      return fail(`Error: ${(err as Error).message}`);
+      if (err instanceof ToolError) out = fail(err.message);
+      else if (err instanceof EnableBankingError) out = fail(`Enable Banking returned ${err.status}: ${err.body.slice(0, 500)}`);
+      else out = fail(`Error: ${(err as Error).message}`);
     }
+    // Whatever the tool changed is written before the answer leaves the server.
+    try {
+      await store().flush();
+    } catch (err) {
+      return fail(`Error: the state could not be saved: ${(err as Error).message}`);
+    }
+    return out;
   };
 }
 

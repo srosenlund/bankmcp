@@ -41,17 +41,17 @@ test("full authorization code flow with PKCE, refresh and revocation", async () 
   const requestId = /name="request" value="([^"]+)"/.exec(out.body)?.[1];
   assert.ok(requestId, "login page carries the request id");
 
-  const wrong = provider.completeLogin(requestId!, "nope", "1.2.3.4");
+  const wrong = await provider.completeLogin(requestId!, "nope", "1.2.3.4");
   assert.ok("error" in wrong && wrong.requestId === requestId);
 
-  const ok = provider.completeLogin(requestId!, "correct horse", "1.2.3.4");
+  const ok = await provider.completeLogin(requestId!, "correct horse", "1.2.3.4");
   assert.ok("redirect" in ok);
   const url = new URL(ok.redirect);
   assert.equal(url.origin + url.pathname, client.redirect_uris[0]);
   assert.equal(url.searchParams.get("state"), "xyz");
   const code = url.searchParams.get("code")!;
 
-  assert.ok("error" in provider.completeLogin(requestId!, "correct horse", "1.2.3.4"), "request id is single use");
+  assert.ok("error" in await provider.completeLogin(requestId!, "correct horse", "1.2.3.4"), "request id is single use");
 
   assert.equal(await provider.challengeForAuthorizationCode(client, code), "challenge");
   const tokens = await provider.exchangeAuthorizationCode(client, code, undefined, client.redirect_uris[0]);
@@ -78,12 +78,12 @@ test("five wrong passwords lock the address out", async () => {
     const { out, res } = fakeRes();
     await provider.authorize(client, { codeChallenge: "c", redirectUri: "https://claude.ai/cb" }, res);
     const id = /name="request" value="([^"]+)"/.exec(out.body)![1]!;
-    provider.completeLogin(id, "wrong", "9.9.9.9");
+    await provider.completeLogin(id, "wrong", "9.9.9.9");
   }
   const { out, res } = fakeRes();
   await provider.authorize(client, { codeChallenge: "c", redirectUri: "https://claude.ai/cb" }, res);
   const id = /name="request" value="([^"]+)"/.exec(out.body)![1]!;
-  const r = provider.completeLogin(id, "correct horse", "9.9.9.9");
+  const r = await provider.completeLogin(id, "correct horse", "9.9.9.9");
   assert.ok("error" in r && /Too many/.test(r.error));
 });
 
@@ -95,12 +95,12 @@ test("revokeAll drops every token", async () => {
   const { out, res } = fakeRes();
   await provider.authorize(client, { codeChallenge: "c", redirectUri: "https://claude.ai/cb" }, res);
   const id = /name="request" value="([^"]+)"/.exec(out.body)![1]!;
-  const ok = provider.completeLogin(id, "correct horse", "5.5.5.5");
+  const ok = await provider.completeLogin(id, "correct horse", "5.5.5.5");
   assert.ok("redirect" in ok);
   assert.deepEqual(events, [{ ok: true, ip: "5.5.5.5", clientName: "Claude" }]);
   const tokens = await provider.exchangeAuthorizationCode(client, new URL(ok.redirect).searchParams.get("code")!, undefined, "https://claude.ai/cb");
   await provider.verifyAccessToken(tokens.access_token);
-  provider.revokeAll();
+  await provider.revokeAll();
   await assert.rejects(provider.verifyAccessToken(tokens.access_token), /Invalid/);
   await assert.rejects(provider.exchangeRefreshToken(client, tokens.refresh_token!), /Invalid/);
 });

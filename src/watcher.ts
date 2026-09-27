@@ -69,6 +69,7 @@ export async function runWatches(opts: { force?: boolean } = {}): Promise<WatchR
     const url = watch?.webhook_url || config.notifyWebhookUrl;
     if (url) await notify(url, e).catch((err) => run.errors.push(`notify: ${(err as Error).message}`));
   }
+  await s.flush();
   return run;
 }
 
