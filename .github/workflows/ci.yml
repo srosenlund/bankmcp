@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   ci:
-    uses: srosenlund/fleet/.github/workflows/ci-node.yml@bb26901ac324a7bd958e69650c27959fc0a2d316
+    uses: srosenlund/fleet/.github/workflows/ci-node.yml@0b64361dcc2c667b683dd35bbea8194cac08ab79
     with:
       node-version: '24'
       lint-command: npm run typecheck
@@ -23,7 +23,7 @@ jobs:
   deploy:
     needs: ci
     if: github.event_name == 'push'
-    uses: srosenlund/fleet/.github/workflows/deploy-sliplane.yml@bb26901ac324a7bd958e69650c27959fc0a2d316
+    uses: srosenlund/fleet/.github/workflows/deploy-sliplane.yml@0b64361dcc2c667b683dd35bbea8194cac08ab79
     with:
       health-url: https://bankmcp.sliplane.app/healthz
     # Environment secrets reach the called job only through inherit.
