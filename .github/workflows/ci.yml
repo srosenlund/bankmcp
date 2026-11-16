@@ -1,5 +1,3 @@
-# .github/workflows/ci.yml for a Sliplane repo (fleet docs/standard.md).
-# Required check: "ci / gate".
 name: ci
 on:
   pull_request:
@@ -15,16 +13,55 @@ concurrency:
 
 jobs:
   ci:
-    uses: srosenlund/fleet/.github/workflows/ci-node.yml@0b64361dcc2c667b683dd35bbea8194cac08ab79
-    with:
-      node-version: '24'
-      lint-command: npm run typecheck
+    name: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
 
   deploy:
     needs: ci
     if: github.event_name == 'push'
-    uses: srosenlund/fleet/.github/workflows/deploy-sliplane.yml@0b64361dcc2c667b683dd35bbea8194cac08ab79
-    with:
-      health-url: https://bankmcp.sliplane.app/healthz
-    # Environment secrets reach the called job only through inherit.
-    secrets: inherit # zizmor: ignore[secrets-inherit]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+    env:
+      HOOK: ${{ secrets.SLIPLANE_DEPLOY_HOOK }}
+      PROJECT: project_7mtiw31sei3u
+      SERVICE: service_umu8f8ef0kjf
+    steps:
+      - name: Require settings and a current main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ -n "$HOOK" ] || { echo "::error::SLIPLANE_DEPLOY_HOOK mangler i environment production"; exit 1; }
+          main=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [ "$main" != "$GITHUB_SHA" ]; then
+            echo "::notice::main er rykket til $main; det run deployer."
+            exit 0
+          fi
+      - name: Trigger deploy hook
+        run: curl -fsS -X POST "$HOOK"
+      - name: Readback (service_deploy_success for this SHA)
+        env:
+          SLIPLANE_API_KEY: ${{ secrets.SLIPLANE_API_KEY }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            sleep 10
+            last=$(curl -fsS -H "Authorization: Bearer $SLIPLANE_API_KEY" \
+              "https://ctrl.sliplane.io/v0/projects/$PROJECT/services/$SERVICE/events" \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); its=d if isinstance(d,list) else d.get("items",[]); print(its[0].get("type","") if its else "")')
+            [ "$last" = "service_deploy_success" ] && { echo "deploy OK"; exit 0; }
+          done
+          echo "::error::service_deploy_success ikke set efter 5 min"; exit 1
