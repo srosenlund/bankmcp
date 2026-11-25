@@ -31,9 +31,24 @@ jobs:
               exit 0
             fi
             git push -u origin "$BRANCH"
-            gh pr create --title "chore: sync upstream noskillish/bankmcp" \
-              --body "Automatisk upstream-merge. Review egne ændringer (ci.yml, Dockerfile, .cursor) før merge." \
-              --base main --head "$BRANCH" || true
+            payload=$(BRANCH="$BRANCH" python3 -c 'import json,os; print(json.dumps({"title": "chore: sync upstream noskillish/bankmcp", "body": "Automatisk upstream-merge. Review egne ændringer (ci.yml, Dockerfile, .cursor) før merge.", "base": "main", "head": os.environ["BRANCH"]}, ensure_ascii=False))')
+            body=$(mktemp)
+            status=$(curl --fail-with-body -sS -o "$body" -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              --data "$payload" \
+              "${GITHUB_API_URL:-https://api.github.com}/repos/$GITHUB_REPOSITORY/pulls") || true
+            case "$status" in
+              201) echo "PR oprettet for $BRANCH." ;;
+              422) echo "::notice::PR findes allerede for $BRANCH." ;;
+              *)
+                echo "::warning::PR kunne ikke oprettes (HTTP ${status:-netværksfejl})."
+                cat "$body" || true
+                ;;
+            esac
+            rm -f "$body"
           else
             git merge --abort || true
             echo "::error::Upstream merge-konflikt (noskillish/bankmcp). Manuel sync kræves."
