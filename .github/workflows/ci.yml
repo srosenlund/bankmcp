@@ -45,7 +45,11 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "$HOOK" ] || { echo "::error::SLIPLANE_DEPLOY_HOOK mangler i environment production"; exit 1; }
-          main=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          main=$(curl --fail-with-body -sS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL:-https://api.github.com}/repos/$GITHUB_REPOSITORY/commits/main" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')
           if [ "$main" != "$GITHUB_SHA" ]; then
             echo "::notice::main er rykket til $main; det run deployer."
             exit 0
