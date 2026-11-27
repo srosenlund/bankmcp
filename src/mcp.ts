@@ -17,6 +17,12 @@ export function createServer(): McpServer {
       ].join(" "),
     },
   );
+  // Fork: TOOL_NAMESPACE=bank gives "bank.list_accounts" so a gateway can route by prefix. Unset = upstream names.
+  const ns = process.env.TOOL_NAMESPACE;
+  if (ns) {
+    const register = server.registerTool.bind(server);
+    server.registerTool = ((name: string, ...rest: unknown[]) => (register as (...a: unknown[]) => unknown)(`${ns}.${name}`, ...rest)) as typeof server.registerTool;
+  }
   registerTools(server);
   registerPrompts(server);
   return server;
